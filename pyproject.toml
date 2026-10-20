@@ -1,0 +1,11 @@
+[project]
+name = "whatsapp-mcp"
+version = "0.1.0"
+description = "MCP local en lecture seule sur la base WhatsApp Desktop (macOS)"
+requires-python = ">=3.11"
+dependencies = ["mcp>=2.3,<3"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+[tool.pytest.ini_options]
+pythonpath = ["."]
