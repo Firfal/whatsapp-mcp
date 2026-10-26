@@ -65,3 +65,31 @@ guard rename(tmp.path, dest.path) == 0 else {
     fail("remplacement de \(dest.path) : \(String(cString: strerror(errno)))")
 }
 log("copie à jour")
+
+// Copie à la demande de vocaux : seuls les chemins listés dans media-request.txt, relatifs au
+// dossier Message, sous Media/ et en .opus, sont copiés vers ~/Library/Caches/whatsapp-mcp/media.
+let request = destDir.appendingPathComponent("media-request.txt")
+if let list = try? String(contentsOf: request, encoding: .utf8) {
+    let messageDir = source.deletingLastPathComponent().appendingPathComponent("Message")
+    let mediaDir = destDir.appendingPathComponent("media")
+    var copied = 0, skipped = 0
+    for raw in list.split(whereSeparator: \.isNewline) {
+        let rel = raw.trimmingCharacters(in: .whitespaces)
+        guard rel.hasPrefix("Media/"), rel.hasSuffix(".opus"), !rel.contains("..") else { skipped += 1; continue }
+        let from = messageDir.appendingPathComponent(rel)
+        let to = mediaDir.appendingPathComponent(rel)
+        if FileManager.default.fileExists(atPath: to.path) { continue }
+        do {
+            try FileManager.default.createDirectory(
+                at: to.deletingLastPathComponent(), withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
+            try FileManager.default.copyItem(at: from, to: to)
+            chmod(to.path, 0o600)
+            copied += 1
+        } catch {
+            skipped += 1
+        }
+    }
+    try? FileManager.default.removeItem(at: request)
+    log("vocaux copiés : \(copied), ignorés : \(skipped)")
+}

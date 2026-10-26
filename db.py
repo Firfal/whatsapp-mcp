@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+import voice
 from config import Config
 
 SNAPSHOT = Path("~/Library/Caches/whatsapp-mcp/snapshot.sqlite").expanduser()
@@ -21,7 +22,7 @@ REQUIRED = {
     "ZWACHATSESSION": {"Z_PK", "ZCONTACTJID", "ZPARTNERNAME", "ZLASTMESSAGEDATE", "ZUNREADCOUNT", "ZSESSIONTYPE"},
     "ZWAMESSAGE": {"Z_PK", "ZCHATSESSION", "ZISFROMME", "ZMESSAGEDATE", "ZTEXT", "ZMESSAGETYPE", "ZFROMJID", "ZGROUPMEMBER", "ZMEDIAITEM", "ZPUSHNAME"},
     "ZWAGROUPMEMBER": {"Z_PK", "ZMEMBERJID", "ZCONTACTNAME", "ZFIRSTNAME"},
-    "ZWAMEDIAITEM": {"Z_PK", "ZTITLE"},
+    "ZWAMEDIAITEM": {"Z_PK", "ZTITLE", "ZMEDIALOCALPATH", "ZMOVIEDURATION"},
     "ZWAPROFILEPUSHNAME": {"ZJID", "ZPUSHNAME"},
 }
 
@@ -137,18 +138,33 @@ def check_schema(conn: sqlite3.Connection) -> None:
         )
 
 
+VOICE_TYPE = 3
+
+
+def format_duration(seconds: float | None) -> str:
+    s = round(seconds or 0)
+    return f"{s // 60}:{s % 60:02d}"
+
+
 class WhatsAppDB:
     def __init__(self, config: Config, snapshot: Path = SNAPSHOT,
-                 refresh: Callable[[Path], None] = ensure_fresh):
+                 refresh: Callable[[Path], None] = ensure_fresh,
+                 fetch_media: Callable[[list[str]], dict[str, Path | None]] = voice.fetch_media,
+                 transcriber: Callable[..., dict[Path, str]] = voice.transcribe,
+                 transcripts_dir: Path = voice.TRANSCRIPTS_DIR):
         self.config = config
         self.snapshot = snapshot
         self.refresh = refresh
+        self.fetch_media = fetch_media
+        self.transcriber = transcriber
+        self.transcripts_dir = transcripts_dir
 
     def _connect(self) -> sqlite3.Connection:
         self.refresh(self.snapshot)
         conn = sqlite3.connect(f"file:{self.snapshot}?mode=ro&immutable=1", uri=True)
         conn.row_factory = sqlite3.Row
         conn.create_function("clean_name", 1, clean_name, deterministic=True)
+        conn.create_function("media_stem", 1, lambda p: Path(p).stem if p else None, deterministic=True)
         check_schema(conn)
         return conn
 
@@ -195,6 +211,7 @@ class WhatsAppDB:
 
     _MESSAGE_SELECT = """
         SELECT m.Z_PK, m.ZCHATSESSION, m.ZISFROMME, m.ZMESSAGEDATE, m.ZTEXT, m.ZMESSAGETYPE, mi.ZTITLE AS media_title,
+               mi.ZMEDIALOCALPATH AS media_path, mi.ZMOVIEDURATION AS duration,
                clean_name(c.ZPARTNERNAME) AS chat_name, c.ZCONTACTJID AS chat_jid,
                clean_name(COALESCE(NULLIF(gm.ZCONTACTNAME, ''), NULLIF(gm.ZFIRSTNAME, ''), NULLIF(pn.ZPUSHNAME, ''),
                         NULLIF(m.ZPUSHNAME, ''), gm.ZMEMBERJID, m.ZFROMJID)) AS group_sender
@@ -205,8 +222,16 @@ class WhatsAppDB:
         LEFT JOIN ZWAMEDIAITEM mi ON mi.Z_PK = m.ZMEDIAITEM
     """
 
-    @staticmethod
-    def _format_message(r: sqlite3.Row) -> dict:
+    def _voice_label(self, r: sqlite3.Row) -> str:
+        label = f"vocal {format_duration(r['duration'])}"
+        if not r["media_path"]:
+            return f"[{label}, fichier non téléchargé sur le Mac]"
+        transcript = voice.read_transcript(r["media_path"], self.transcripts_dir)
+        if transcript is None:
+            return f"[{label}, pas encore transcrit]"
+        return f"[{label}] « {transcript} »"
+
+    def _format_message(self, r: sqlite3.Row) -> dict:
         if r["ZISFROMME"]:
             sender = "moi"
         elif (r["chat_jid"] or "").endswith("@g.us"):
@@ -216,7 +241,9 @@ class WhatsAppDB:
         mtype = r["ZMESSAGETYPE"] or 0
         # légende d'une photo ou d'une vidéo, nom d'un document
         text = r["ZTEXT"] or r["media_title"]
-        if mtype != 0:
+        if mtype == VOICE_TYPE:
+            text = self._voice_label(r)
+        elif mtype != 0:
             label = MESSAGE_TYPES.get(mtype, f"autre contenu, type {mtype}")
             text = f"[{label}: {text}]" if text else f"[{label}]"
         return {
@@ -286,10 +313,13 @@ class WhatsAppDB:
                 ids = self._allowed_ids(conn)
             if not ids:
                 return []
+            # les vocaux transcrits sont cherchés dans leur transcription
+            stems = self._transcripts_matching(query)
             sql = (self._MESSAGE_SELECT
-                   + f" WHERE m.ZCHATSESSION IN ({','.join('?' * len(ids))}) AND m.ZTEXT LIKE ? ESCAPE '\\'")
+                   + f" WHERE m.ZCHATSESSION IN ({','.join('?' * len(ids))})"
+                   + f" AND (m.ZTEXT LIKE ? ESCAPE '\\' OR media_stem(mi.ZMEDIALOCALPATH) IN ({','.join('?' * len(stems))}))")
             escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            params: list = [*ids, f"%{escaped}%"]
+            params: list = [*ids, f"%{escaped}%", *stems]
             if (s := parse_date(since)) is not None:
                 sql += " AND m.ZMESSAGEDATE >= ?"
                 params.append(s)
@@ -383,3 +413,60 @@ class WhatsAppDB:
                     "last": iso(stats["last"]),
                 },
             }
+
+    # --- vocaux --------------------------------------------------------------
+
+    def _transcripts_matching(self, query: str) -> list[str]:
+        if not self.transcripts_dir.exists():
+            return []
+        q = query.lower()
+        return [p.stem for p in self.transcripts_dir.glob("*.txt") if q in p.read_text().lower()]
+
+    def transcribe_voice_notes(self, chat: str | None = None, since: str | None = None,
+                               until: str | None = None, message_ids: list[int] | None = None,
+                               limit: int = 10) -> dict:
+        with self._connect() as conn:
+            ids = [self._resolve_chat(conn, chat)["Z_PK"]] if chat else self._allowed_ids(conn)
+            if not ids:
+                return {"transcribed": 0, "voice_notes": []}
+            sql = (self._MESSAGE_SELECT
+                   + f" WHERE m.ZCHATSESSION IN ({','.join('?' * len(ids))}) AND m.ZMESSAGETYPE = ?")
+            params: list = [*ids, VOICE_TYPE]
+            if message_ids:
+                sql += f" AND m.Z_PK IN ({','.join('?' * len(message_ids))})"
+                params += list(message_ids)
+            if (s := parse_date(since)) is not None:
+                sql += " AND m.ZMESSAGEDATE >= ?"
+                params.append(s)
+            if (u := parse_date(until)) is not None:
+                sql += " AND m.ZMESSAGEDATE < ?"
+                params.append(u)
+            sql += " ORDER BY m.ZMESSAGEDATE DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
+
+        todo = [r for r in rows
+                if r["media_path"] and voice.read_transcript(r["media_path"], self.transcripts_dir) is None]
+        new = 0
+        if todo:
+            files = self.fetch_media([r["media_path"] for r in todo])
+            available = {files[r["media_path"]]: r["media_path"] for r in todo if files.get(r["media_path"])}
+            if available:
+                texts = self.transcriber(list(available), model=self.config.whisper_model,
+                                         language=self.config.whisper_language)
+                for path, text in texts.items():
+                    voice.save_transcript(available[path], text or "(rien d'audible)", self.transcripts_dir)
+                    new += 1
+
+        out = []
+        for r in rows[::-1]:
+            item = self._format_message(r)
+            item["duration"] = format_duration(r["duration"])
+            transcript = voice.read_transcript(r["media_path"], self.transcripts_dir) if r["media_path"] else None
+            item["transcript"] = transcript
+            if transcript is None:
+                item["status"] = ("fichier non téléchargé sur le Mac (ouvrez le vocal dans WhatsApp Desktop puis réessayez)"
+                                  if not r["media_path"] else "fichier pas encore copié ou transcription échouée")
+            del item["text"]
+            out.append(item)
+        return {"transcribed": new, "voice_notes": out}

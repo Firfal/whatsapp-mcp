@@ -11,8 +11,12 @@ PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 
 mkdir -p "$BIN_DIR" "$LOG_DIR" "$HOME/Library/LaunchAgents"
 swiftc -O "$REPO/helper/wa-snapshot.swift" -o "$BIN"
-# Signature locale avec un identifiant fixe : macOS retire l'accès si le binaire change.
-codesign --force --sign - --identifier "$LABEL" "$BIN"
+# Signature avec la première identité de signature valide du trousseau : l'accès complet au disque
+# reste accordé après une recompilation. Sans identité, signature ad hoc : l'accès est à redonner
+# à chaque compilation.
+IDENTITY=$(security find-identity -v -p codesigning | awk -F'"' 'NR==1 && NF>2 {print $2}')
+codesign --force --sign "${IDENTITY:--}" --identifier "$LABEL" "$BIN"
+echo "Signé avec : ${IDENTITY:-ad hoc}"
 
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

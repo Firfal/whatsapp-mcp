@@ -1,4 +1,4 @@
-"""Configuration : discussions exclues ou seules autorisées."""
+"""Configuration : discussions exclues ou seules autorisées, transcription des vocaux."""
 import os
 import tomllib
 from dataclasses import dataclass, field
@@ -11,6 +11,8 @@ CONFIG_PATH = Path(os.environ.get("WHATSAPP_MCP_CONFIG", "~/.config/whatsapp-mcp
 class Config:
     exclude_chats: list[str] = field(default_factory=list)
     only_chats: list[str] = field(default_factory=list)
+    whisper_model: str = "small"
+    whisper_language: str | None = None  # None : détection automatique
 
     def allows(self, name: str | None, jid: str | None) -> bool:
         keys = {k.lower() for k in (name, jid) if k}
@@ -26,4 +28,6 @@ def load_config(path: Path = CONFIG_PATH) -> Config:
     return Config(
         exclude_chats=list(data.get("exclude_chats", [])),
         only_chats=list(data.get("only_chats", [])),
+        whisper_model=data.get("whisper_model", "small"),
+        whisper_language=data.get("whisper_language") or None,
     )

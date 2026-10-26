@@ -17,7 +17,7 @@ def explain_errors(fn):
     def wrapper(*args, **kwargs):
         try:
             return fn(*args, **kwargs)
-        except (ValueError, SchemaError, FileNotFoundError, PermissionError) as exc:
+        except (ValueError, SchemaError, FileNotFoundError, PermissionError, RuntimeError) as exc:
             raise ToolError(str(exc)) from exc
     return wrapper
 
@@ -65,6 +65,20 @@ def pending_replies(min_hours: float = 24, max_days: float = 30, include_groups:
 def chat_activity(chat: str, days: int = 90) -> dict:
     """Résumé chiffré d'une relation : premier échange, dernier message de chaque côté, volume sur la période."""
     return db.chat_activity(chat, days)
+
+
+@mcp.tool()
+@explain_errors
+def transcribe_voice_notes(chat: str | None = None, since: str | None = None, until: str | None = None,
+                           message_ids: list[int] | None = None, limit: int = 10) -> dict:
+    """Transcrit les vocaux en local avec whisper (rien n'est envoyé en ligne) et renvoie leur texte.
+
+    Sélection : une discussion (`chat`), une période (`since` / `until`, dates ISO) et/ou des `message_ids`
+    (champ `id` renvoyé par get_messages). Les `limit` vocaux les plus récents de la sélection sont traités.
+    Les transcriptions sont gardées en cache : un vocal n'est transcrit qu'une fois, puis il apparaît
+    aussi sous forme de texte dans get_messages et search_messages. Compter environ 5 à 10 s par minute d'audio.
+    """
+    return db.transcribe_voice_notes(chat, since, until, message_ids, limit)
 
 
 if __name__ == "__main__":
